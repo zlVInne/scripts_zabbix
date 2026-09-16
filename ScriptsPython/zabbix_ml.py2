@@ -1,0 +1,185 @@
+import requests
+import urllib3
+import time
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+
+# Desativa os avisos de conexão insegura (SSL) no terminal
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==========================================
+# CONFIGURAÇÕES GERAIS
+# ==========================================
+ZABBIX_URL = 'https://172.23.104.62/zabbix/api_jsonrpc.php'
+USUARIO = 'ml.api'
+SENHA = 'Tropico123'
+
+# ==========================================
+# PASSO 1: AUTENTICAÇÃO (ZABBIX 7.0)
+# ==========================================
+payload_login = {
+    "jsonrpc": "2.0",
+    "method": "user.login",
+    "params": {
+        "username": USUARIO,
+        "password": SENHA
+    },
+    "id": 1,
+    "auth": None
+}
+
+print("Tentando conectar ao Zabbix (ignorando SSL)...")
+resposta_login = requests.post(ZABBIX_URL, json=payload_login, verify=False)
+dados_login = resposta_login.json()
+
+if 'result' in dados_login:
+    auth_token = dados_login['result']
+    print("[OK] Conectado ao Zabbix 7.0!")
+else:
+    print(f"[ERRO] Falha no login: {dados_login.get('error')}")
+    exit()
+
+# Cabeçalho padrão para as próximas requisições usando o token gerado
+headers = {
+    'Content-Type': 'application/json-rpc',
+    'Authorization': f'Bearer {auth_token}'
+}
+
+# ==========================================
+# PASSO 2: BUSCANDO OS HOSTS SBC
+# ==========================================
+payload_hosts = {
+    "jsonrpc": "2.0",
+    "method": "host.get",
+    "params": {
+        "filter": {
+            "host": ["SBC_172.26.40.175", "SBC_172.26.40.75"]
+        },
+        "output": ["hostid", "host"]
+    },
+    "id": 2
+}
+
+resposta_hosts = requests.post(ZABBIX_URL, headers=headers, json=payload_hosts, verify=False)
+dados_hosts = resposta_hosts.json()
+
+lista_hosts = []
+if 'result' in dados_hosts:
+    lista_hosts = dados_hosts['result']
+    print("\n[OK] Hosts encontrados.")
+else:
+    print(f"[ERRO] Falha ao buscar hosts: {dados_hosts.get('error')}")
+    exit()
+
+# ==========================================
+# PASSO 3: BUSCANDO OS ITEM IDs (MÉTRICAS)
+# ==========================================
+chaves_desejadas = ["apSysGlobalConSess", "apSysNATCapacity", "apSysGlobalCPS"]
+host_ids = [host['hostid'] for host in lista_hosts]
+
+payload_items = {
+    "jsonrpc": "2.0",
+    "method": "item.get",
+    "params": {
+        "hostids": host_ids,
+        "search": {
+            "key_": chaves_desejadas
+        },
+        "searchByAny": True,
+        "output": ["itemid", "name", "key_", "hostid", "value_type"]
+    },
+    "id": 3
+}
+
+resposta_items = requests.post(ZABBIX_URL, headers=headers, json=payload_items, verify=False)
+dados_items = resposta_items.json()
+
+itens_mapeados = {host: {} for host in host_ids}
+
+if 'result' in dados_items:
+    lista_items = dados_items['result']
+    print("[OK] Itens (Métricas) mapeados.")
+    for item in lista_items:
+        h_id = item['hostid']
+        i_id = item['itemid']
+        chave = item['key_']
+        tipo = item['value_type']
+        itens_mapeados[h_id][chave] = {"itemid": i_id, "tipo": tipo}
+else:
+    print(f"[ERRO] Falha ao buscar itens: {dados_items.get('error')}")
+    exit()
+
+# ==========================================
+# PASSO 4: EXTRAINDO DADOS HISTÓRICOS
+# ==========================================
+print("\n[OK] Buscando histórico recente (última 1 hora)...")
+
+tempo_agora = int(time.time())
+tempo_1_hora_atras = tempo_agora - 3600
+
+# Usando o SBC .75 (ID 10706) e a métrica de Sessões para o teste
+id_host_teste = "10706"
+id_item_teste = itens_mapeados[id_host_teste]["apSysGlobalConSess"]["itemid"]
+tipo_item_teste = itens_mapeados[id_host_teste]["apSysGlobalConSess"]["tipo"]
+
+payload_history = {
+    "jsonrpc": "2.0",
+    "method": "history.get",
+    "params": {
+        "output": "extend",
+        "history": tipo_item_teste,
+        "itemids": [id_item_teste],
+        "time_from": tempo_1_hora_atras,
+        "time_till": tempo_agora,
+        "sortfield": "clock",
+        "sortorder": "ASC"
+    },
+    "id": 4
+}
+
+resposta_history = requests.post(ZABBIX_URL, headers=headers, json=payload_history, verify=False)
+dados_history = resposta_history.json()
+
+# ==========================================
+# PASSO 5: PREPARANDO DADOS & FEATURE ENGINEERING
+# ==========================================
+if 'result' in dados_history:
+    historico = dados_history['result']
+    
+    if len(historico) > 0:
+        df = pd.DataFrame(historico)
+        df['clock'] = pd.to_datetime(pd.to_numeric(df['clock']), unit='s')
+        df['value'] = pd.to_numeric(df['value'])
+        df = df[['clock', 'value']]
+        df.rename(columns={'clock': 'horario', 'value': 'sessoes'}, inplace=True)
+        
+        # A MÁGICA ACONTECE AQUI: Calculando a variação entre uma leitura e outra
+        df['variacao'] = df['sessoes'].diff().fillna(0)
+        
+        # ==========================================
+        # PASSO 6: INTELIGÊNCIA ARTIFICIAL (DETECÇÃO DE ANOMALIAS)
+        # ==========================================
+        print("[OK] Treinando modelo de Machine Learning (Isolation Forest)...")
+        
+        modelo_ia = IsolationForest(contamination=0.05, random_state=42)
+        
+        # Agora ensinamos a IA a olhar TANTO para o valor absoluto quanto para a variação brusca
+        df['score_ia'] = modelo_ia.fit_predict(df[['sessoes', 'variacao']])
+        
+        df['status'] = df['score_ia'].apply(lambda x: '⚠️ ANOMALIA' if x == -1 else '✅ NORMAL')
+        
+        print("\n -> Resultado da Análise da IA (Visão Completa do Pulo de Tráfego):")
+        # Vamos imprimir as linhas onde a variação foi maior que 1000, só para vermos a IA pegando o pico,
+        # além das últimas 5 linhas normais para comparar.
+        
+        anomalias_ou_picos = df[df['variacao'] > 1000]
+        ultimas_linhas = df.tail(5)
+        
+        resultado_final = pd.concat([anomalias_ou_picos, ultimas_linhas]).drop_duplicates().sort_index()
+        
+        print(resultado_final.to_string(index=False))
+        
+    else:
+        print(" -> Nenhum dado coletado nesta última 1 hora.")
+else:
+    print(f"[ERRO] Falha ao buscar histórico: {dados_history.get('error')}")
